@@ -58,6 +58,25 @@ def secrets_pull_default(
     )
 
 
+# --- DEV defaults -----------------------------------------------------------
+
+
+def config_dev_default() -> ResourceOption:
+    """CONFIGS in DEV mode: fetch once, cache to ~/.sailor/cache, live-reload."""
+    return ResourceOption(
+        definition=ResourceDefinition(kind=ResourceKind.CONFIGS),
+        fetch_def=FetchDefinition(fetch=FetchOption.DEV),
+    )
+
+
+def secrets_dev_default() -> ResourceOption:
+    """SECRETS in DEV mode: fetch once, cache to ~/.sailor/cache, live-reload."""
+    return ResourceOption(
+        definition=ResourceDefinition(kind=ResourceKind.SECRETS),
+        fetch_def=FetchDefinition(fetch=FetchOption.DEV),
+    )
+
+
 # --- MISC defaults ----------------------------------------------------------
 
 

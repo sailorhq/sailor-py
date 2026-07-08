@@ -51,6 +51,51 @@ def test_explicit_fields_take_precedence_over_env(monkeypatch):
     assert conn.namespace == "explicit-ns"
 
 
+def test_resolve_from_sailor_uri_env(monkeypatch):
+    # SAILOR_URI (Go's canonical env var) supplies a full sailor:// URI.
+    monkeypatch.delenv("SAILOR_URL", raising=False)
+    monkeypatch.setenv("SAILOR_URI", "sailor://ak:sk@host/ns/app")
+    conn = resolve_connection(ConnectionOption())
+    assert conn.addr == "https://host"
+    assert conn.namespace == "ns"
+    assert conn.app == "app"
+    assert conn.access_key == "ak"
+    assert conn.secret_key == "sk"
+
+
+def test_sailor_uri_takes_precedence_over_url(monkeypatch):
+    monkeypatch.setenv("SAILOR_URI", "sailor://ak:sk@uri-host/ns/app")
+    monkeypatch.setenv("SAILOR_URL", "https://url-host")
+    conn = resolve_connection(ConnectionOption())
+    assert conn.addr == "https://uri-host"
+
+
+def test_local_config_go_shape(tmp_path, monkeypatch):
+    import json as _json
+
+    import sailor.connection as connmod
+
+    cfg = tmp_path / "config"
+    cfg.write_text(
+        _json.dumps(
+            {
+                "manifest": {"envs": [{"name": "prod", "host": "https://prod-host"}]},
+                "env": "prod",
+                "token": "tok-123",
+                "user": "dev@example.com",
+            }
+        )
+    )
+    monkeypatch.setattr(connmod, "LOCAL_CONFIG_PATH", cfg)
+    conn = resolve_connection(
+        ConnectionOption(namespace="ns", app="app", access_key="ak", secret_key="sk"),
+        use_sailor_config=True,
+    )
+    assert conn.addr == "https://prod-host"
+    assert conn.token == "tok-123"
+    assert conn.env == "prod"
+
+
 def test_resolve_from_env(monkeypatch):
     monkeypatch.setenv("SAILOR_URL", "https://h")
     monkeypatch.setenv("SAILOR_NS", "ns")

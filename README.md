@@ -1,4 +1,4 @@
-# Sailor-Py
+# 🐧 Sailor Python - Consumer
 
 A type-safe Python client for [Sailor](https://github.com/sailorhq/sailor) —
 configuration and secret management for cloud-native applications. This is the
@@ -74,14 +74,30 @@ init = InitOption(
 )
 ```
 
+## Dev mode
+
+`config_dev_default()` / `secrets_dev_default()` (fetch strategy `DEV`) support
+local iteration: on first run they fetch from the API once and cache the
+response to `~/.sailor/cache/{ns}-{app}-{env}-{kind}.json`; thereafter they read
+that cache and **watch it for edits**, so you can tweak a local JSON copy and get
+live reload without a server round-trip.
+
+```python
+init = InitOption(
+    connection=ConnectionOption(uri="sailor://AK:SK@host/team/billing"),
+    resources=[defaults.config_dev_default(), defaults.secrets_dev_default()],
+)
+```
+
 ## Connection resolution
 
 Fields are resolved in this order (earlier wins, never overwritten):
 
 1. Explicit `ConnectionOption` fields
-2. `sailor://accessKey:secretKey@host/namespace/app` URI (`uri` field or `SAILOR_URL`)
-3. Environment: `SAILOR_URL`, `SAILOR_NS`, `SAILOR_APP`, `SAILOR_ACCESS_KEY`, `SAILOR_SECRET_KEY`
-4. `~/.sailor/config` (only when `use_sailor_config=True`)
+2. `sailor://accessKey:secretKey@host/namespace/app` URI — `uri` field, else
+   `SAILOR_URI` (the canonical env var), else `SAILOR_URL` (URI or plain base URL)
+3. Environment: `SAILOR_NS`, `SAILOR_APP`, `SAILOR_ACCESS_KEY`, `SAILOR_SECRET_KEY`
+4. `~/.sailor/config` written by the Sailor CLI (only when `use_sailor_config=True`)
 
 The optional bearer token is sent as the `x-token` header.
 
