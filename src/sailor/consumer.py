@@ -27,6 +27,7 @@ from pydantic import BaseModel
 
 from .connection import resolve_connection
 from .crypto import decrypt_secrets
+from .dev import DevReader
 from .errors import (
     ConfigsNotLoadedError,
     EmptyResourceListError,
@@ -69,6 +70,7 @@ class Consumer(Generic[C, S]):
         self._transport: Transport | None = None
         self._poller: Poller | None = None
         self._volume: VolumeReader | None = None
+        self._dev: DevReader | None = None
         self._started = False
 
     # -- lifecycle ----------------------------------------------------------
@@ -81,15 +83,24 @@ class Consumer(Generic[C, S]):
         resources = self._init.resources
         needs_pull = any(r.fetch_def.fetch is FetchOption.PULL for r in resources)
         needs_volume = any(r.fetch_def.fetch is FetchOption.VOLUME for r in resources)
+        needs_dev = any(r.fetch_def.fetch is FetchOption.DEV for r in resources)
+        watch = True if self._init.watch is None else self._init.watch
 
-        if needs_pull:
-            self._transport = Transport(self._conn)
-            self._poller = Poller(self._transport, self._conn, self._store_raw, self._log)
-            self._poller.start(resources)
+        # DEV (cache miss) and PULL both fetch over HTTP — share one transport.
+        if needs_pull or needs_dev:
+            transport = Transport(self._conn)
+            self._transport = transport
+
+            if needs_pull:
+                self._poller = Poller(transport, self._conn, self._store_raw, self._log)
+                self._poller.start(resources)
+
+            if needs_dev:
+                self._dev = DevReader(transport, self._conn, self._store_raw, self._log)
+                self._dev.start(resources, watch=watch)
 
         if needs_volume:
             self._volume = VolumeReader(self._conn, self._store_raw, self._log)
-            watch = True if self._init.watch is None else self._init.watch
             self._volume.start(resources, watch=watch)
 
         self._started = True
@@ -100,6 +111,8 @@ class Consumer(Generic[C, S]):
             self._poller.stop()
         if self._volume is not None:
             self._volume.stop()
+        if self._dev is not None:
+            self._dev.stop()
         if self._transport is not None:
             self._transport.close()
         self._started = False

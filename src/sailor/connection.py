@@ -26,6 +26,9 @@ from .errors import (
 )
 from .options import ConnectionOption
 
+# SAILOR_URI is Go's canonical connection env var (a full sailor:// URI);
+# SAILOR_URL is accepted too (URI or plain base URL). SAILOR_URI wins.
+ENV_URI = "SAILOR_URI"
 ENV_URL = "SAILOR_URL"
 ENV_NS = "SAILOR_NS"
 ENV_APP = "SAILOR_APP"
@@ -58,29 +61,30 @@ def _parse_uri(uri: str) -> dict[str, str]:
 
 
 def _from_local_config() -> dict[str, str]:
-    """Load ``~/.sailor/config`` (JSON). Returns an empty dict if absent."""
+    """Load ``~/.sailor/config`` written by the Sailor CLI (``sailor login``).
+
+    Shape matches sailor-go::
+
+        {"manifest": {"envs": [{"name": ..., "host": ...}]},
+         "env": <active env name>, "token": ..., "user": ...}
+
+    The active ``env``'s ``host`` becomes ``addr`` and ``token`` becomes the
+    bearer token. Namespace/app/keys are not in this file (they come from the
+    URI, explicit fields, or env), matching the Go client.
+    """
     if not LOCAL_CONFIG_PATH.exists():
         return {}
     raw = json.loads(LOCAL_CONFIG_PATH.read_text())
     out: dict[str, str] = {}
-    if "token" in raw:
+    if raw.get("token"):
         out["token"] = raw["token"]
-    if "env" in raw:
-        out["env"] = raw["env"]
-    # environments[].{url,namespace,app,access_key,secret_key} for the active env
-    envs = raw.get("environments") or []
     active = raw.get("env")
+    if active:
+        out["env"] = active
+    envs = (raw.get("manifest") or {}).get("envs") or []
     for entry in envs:
-        if active is None or entry.get("name") == active:
-            for src, dst in (
-                ("url", "addr"),
-                ("namespace", "namespace"),
-                ("app", "app"),
-                ("access_key", "access_key"),
-                ("secret_key", "secret_key"),
-            ):
-                if entry.get(src):
-                    out.setdefault(dst, entry[src])
+        if entry.get("name") == active and entry.get("host"):
+            out["addr"] = entry["host"]
             break
     return out
 
@@ -96,8 +100,8 @@ def resolve_connection(
     conn: ConnectionOption, *, use_sailor_config: bool = False
 ) -> ConnectionOption:
     """Return a validated, fully-populated connection or raise an init error."""
-    # 2. URI (explicit field, else env).
-    uri = conn.uri or os.environ.get(ENV_URL)
+    # 2. URI: explicit field, else SAILOR_URI (Go's canonical), else SAILOR_URL.
+    uri = conn.uri or os.environ.get(ENV_URI) or os.environ.get(ENV_URL)
     if uri and uri.startswith("sailor://"):
         _fill(conn, _parse_uri(uri))
     elif uri and conn.addr is None:
