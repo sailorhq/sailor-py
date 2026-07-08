@@ -115,6 +115,25 @@ uv run ruff check .  # lint
 uv run mypy          # types
 ```
 
+## Releasing
+
+Releases publish to PyPI automatically via
+[`.github/workflows/publish.yml`](.github/workflows/publish.yml) using PyPI
+**Trusted Publishing** (OIDC) — no API tokens or repository secrets.
+
+One-time PyPI setup: create the project's *pending publisher* pointing at this
+repo, the `publish.yml` workflow, and a `pypi` environment.
+
+To cut a release, bump `version` in `pyproject.toml`, then tag and push:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The tag triggers a build (`uv build`) and upload. Test the flow first with
+TestPyPI or `twine check dist/*` locally.
+
 ## License
 
 GPL-3.0-or-later, matching upstream Sailor.
