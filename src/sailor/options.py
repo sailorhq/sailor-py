@@ -6,6 +6,7 @@ constants used by Sailor exactly.
 
 from __future__ import annotations
 
+# ruff: noqa: UP045, UP007
 from enum import Enum, IntEnum
 from typing import Optional
 
