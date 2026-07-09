@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 # Default mounted volume paths (match sailor-go defaults).
 DEFAULT_CONFIG_VOLUME_PATH = "/etc/sailor/_config"
-DEFAULT_SECRET_VOLUME_PATH = "/etc/sailor/_secret"
+DEFAULT_SECRET_VOLUME_PATH = "/etc/sailor/secret/_secret"
 
 # Default polling interval for PULL resources.
 DEFAULT_PULL_INTERVAL_SECONDS = 10.0
