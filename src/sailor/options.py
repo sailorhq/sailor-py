@@ -7,6 +7,7 @@ constants used by Sailor exactly.
 from __future__ import annotations
 
 from enum import Enum, IntEnum
+from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -41,14 +42,14 @@ class _Model(BaseModel):
 class ConnectionOption(_Model):
     """How to reach and authenticate against the Sailor server."""
 
-    uri: str | None = None
-    addr: str | None = None
-    namespace: str | None = None
-    app: str | None = None
-    access_key: str | None = None
-    secret_key: str | None = None
-    token: str | None = None
-    env: str | None = None
+    uri: Optional[str] = None
+    addr: Optional[str] = None
+    namespace: Optional[str] = None
+    app: Optional[str] = None
+    access_key: Optional[str] = None
+    secret_key: Optional[str] = None
+    token: Optional[str] = None
+    env: Optional[str] = None
     socket_timeout: float = 30.0
 
 
@@ -82,5 +83,5 @@ class InitOption(_Model):
     connection: ConnectionOption
     resources: list[ResourceOption]
     logging: bool = False
-    watch: bool | None = None
+    watch: Optional[bool] = None
     use_sailor_config: bool = False
