@@ -43,7 +43,7 @@ def _parse_uri(uri: str) -> dict[str, str]:
     parsed = urlparse(uri)
     out: dict[str, str] = {}
     if parsed.hostname:
-        scheme = "https"
+        scheme = "http"
         netloc = parsed.hostname
         if parsed.port:
             netloc = f"{netloc}:{parsed.port}"
