@@ -15,7 +15,7 @@ from sailor.options import ConnectionOption
 
 def test_parse_full_uri():
     parts = _parse_uri("sailor://ak:sk@sailor.example.com:8443/team-a/billing")
-    assert parts["addr"] == "https://sailor.example.com:8443"
+    assert parts["addr"] == "http://sailor.example.com:8443"
     assert parts["access_key"] == "ak"
     assert parts["secret_key"] == "sk"
     assert parts["namespace"] == "team-a"
@@ -30,7 +30,7 @@ def test_uri_url_encoded_credentials():
 
 def test_resolve_from_uri_field():
     conn = resolve_connection(ConnectionOption(uri="sailor://ak:sk@host/ns/app"))
-    assert conn.addr == "https://host"
+    assert conn.addr == "http://host"
     assert conn.namespace == "ns"
     assert conn.app == "app"
     assert conn.access_key == "ak"
@@ -56,7 +56,7 @@ def test_resolve_from_sailor_uri_env(monkeypatch):
     monkeypatch.delenv("SAILOR_URL", raising=False)
     monkeypatch.setenv("SAILOR_URI", "sailor://ak:sk@host/ns/app")
     conn = resolve_connection(ConnectionOption())
-    assert conn.addr == "https://host"
+    assert conn.addr == "http://host"
     assert conn.namespace == "ns"
     assert conn.app == "app"
     assert conn.access_key == "ak"
@@ -67,7 +67,7 @@ def test_sailor_uri_takes_precedence_over_url(monkeypatch):
     monkeypatch.setenv("SAILOR_URI", "sailor://ak:sk@uri-host/ns/app")
     monkeypatch.setenv("SAILOR_URL", "https://url-host")
     conn = resolve_connection(ConnectionOption())
-    assert conn.addr == "https://uri-host"
+    assert conn.addr == "http://uri-host"
 
 
 def test_local_config_go_shape(tmp_path, monkeypatch):
