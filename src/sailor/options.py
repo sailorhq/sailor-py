@@ -81,7 +81,10 @@ class ResourceOption(_Model):
 class InitOption(_Model):
     """Top-level options passed to :class:`~sailor.consumer.Consumer`."""
 
-    connection: ConnectionOption
+    # Optional: an empty ConnectionOption is filled in from SAILOR_URI / the
+    # SAILOR_* env vars / ~/.sailor/config during connection resolution, so
+    # InitOption(resources=[...]) works when the connection lives in the env.
+    connection: ConnectionOption = Field(default_factory=ConnectionOption)
     resources: list[ResourceOption]
     logging: bool = False
     watch: Optional[bool] = None

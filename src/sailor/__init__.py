@@ -37,7 +37,7 @@ from .options import (
     ResourceOption,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.1.3"
 
 __all__ = [
     "Consumer",
