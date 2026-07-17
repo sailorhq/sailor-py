@@ -7,7 +7,9 @@ from sailor.options import (
     DEFAULT_CONFIG_VOLUME_PATH,
     DEFAULT_PULL_INTERVAL_SECONDS,
     DEFAULT_SECRET_VOLUME_PATH,
+    ConnectionOption,
     FetchOption,
+    InitOption,
     ResourceKind,
 )
 
@@ -16,6 +18,21 @@ def test_resource_kind_values_match_wire():
     assert ResourceKind.CONFIGS.value == "config"
     assert ResourceKind.SECRETS.value == "secret"
     assert ResourceKind.MISC.value == "misc"
+
+
+def test_init_option_connection_is_optional():
+    # InitOption(resources=[...]) works with no connection — it defaults to an
+    # empty ConnectionOption that is later filled from SAILOR_URI / env.
+    init = InitOption(resources=[defaults.config_pull_default()])
+    assert isinstance(init.connection, ConnectionOption)
+    assert init.connection.uri is None and init.connection.addr is None
+
+
+def test_init_option_connection_defaults_are_independent():
+    # default_factory must produce a fresh instance per InitOption, not a shared one.
+    a = InitOption(resources=[defaults.config_pull_default()])
+    b = InitOption(resources=[defaults.config_pull_default()])
+    assert a.connection is not b.connection
 
 
 def test_fetch_option_values_match_go():
