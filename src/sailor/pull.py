@@ -1,90 +1,130 @@
-"""PULL fetch engine: initial fetch plus optional background polling.
-
-Each non-``once`` PULL resource gets a daemon thread that re-fetches every
-``pull_interval`` seconds. Failures fall back (when enabled) and otherwise are
-reported to a logger callback and retried on the next tick — the thread never
-dies on a transient error, matching ``sailor-go``'s ``keepPullingResource``.
-"""
+"""PULL fetch engine: initial fetch with fallback + non-recursive polling loop (CONS-PULL-*)."""
 
 from __future__ import annotations
 
 import threading
 from typing import Callable
 
-from .errors import FetchError, FetchFallbackFailedError
-from .fallback import load_fallback
-from .options import ConnectionOption, FetchOption, ResourceKind, ResourceOption
-from .transport import Transport
+import httpx
 
-# Callback invoked with freshly fetched raw bytes for a resource.
-OnRaw = Callable[[ResourceKind, str, bytes], None]
-OnError = Callable[[str], None]
+from .connection import ResolvedConnection
+from .deps import _Deps
+from .fallback import apply_fallback
+from .logger import Logger, LogLevel, emit_event
+from .state import ResourceState, StateManager, mode_name
+from .transport import Transport
 
 
 class Poller:
-    """Owns PULL threads for a set of resources."""
+    """Manages initial PULL loads and background polling threads."""
 
     def __init__(
         self,
         transport: Transport,
-        conn: ConnectionOption,
-        on_raw: OnRaw,
-        on_error: OnError | None = None,
+        conn: ResolvedConnection,
+        state_mgr: StateManager,
+        deps: _Deps,
+        logger: Logger,
+        stop_event: threading.Event,
+        spawn: Callable[[Callable[[], None], str], None],
+        *,
+        request_timeout: float = 10.0,
     ) -> None:
         self._transport = transport
         self._conn = conn
-        self._on_raw = on_raw
-        self._on_error = on_error or (lambda _msg: None)
-        self._stop = threading.Event()
-        self._threads: list[threading.Thread] = []
+        self._state_mgr = state_mgr
+        self._deps = deps
+        self._logger = logger
+        self._stop = stop_event
+        self._spawn = spawn
+        self._request_timeout = request_timeout
 
-    def _fetch_once(self, res: ResourceOption) -> bytes:
-        """Fetch a resource, falling back if enabled. Raises on total failure."""
-        kind = res.definition.kind
-        name = res.definition.name
+    def load_initial(self, state: ResourceState) -> None:
+        """Fetch initially, falling back on transport/non-200 error (CONS-PULL-1)."""
+        now = self._deps.clock.now()
         try:
-            return self._transport.fetch(kind, name)
-        except FetchError as exc:
-            if res.fallback_enabled:
-                return load_fallback(
-                    self._conn.app or "",
-                    kind,
-                    timeout=self._conn.socket_timeout,
-                )
-            raise FetchFallbackFailedError(str(exc)) from exc
-
-    def start(self, resources: list[ResourceOption]) -> None:
-        """Do the initial fetch for every PULL resource, then spawn pollers."""
-        pull_resources = [r for r in resources if r.fetch_def.fetch is FetchOption.PULL]
-        # Initial synchronous fetch — surfaces auth/connectivity errors eagerly.
-        for res in pull_resources:
-            data = self._fetch_once(res)
-            self._on_raw(res.definition.kind, res.definition.name, data)
-
-        # Background polling for resources that are not one-shot.
-        for res in pull_resources:
-            if res.fetch_def.once:
-                continue
-            thread = threading.Thread(
-                target=self._poll_loop,
-                args=(res,),
-                name=f"sailor-pull-{res.definition.kind.value}-{res.definition.name}",
-                daemon=True,
+            res = self._transport.fetch_resource(state.name)
+        except httpx.HTTPError as exc:
+            apply_fallback(
+                self._conn.app,
+                state,
+                self._state_mgr,
+                self._deps,
+                self._logger,
+                http_client=self._transport.client,
+                timeout=self._request_timeout,
+                reason=f"transport: {exc}",
             )
-            thread.start()
-            self._threads.append(thread)
+            return
 
-    def _poll_loop(self, res: ResourceOption) -> None:
-        interval = res.fetch_def.pull_interval
-        while not self._stop.wait(interval):
+        self._state_mgr.check_encrypted_header(state, res.encrypted_header)
+        if res.status_code != 200:
+            apply_fallback(
+                self._conn.app,
+                state,
+                self._state_mgr,
+                self._deps,
+                self._logger,
+                http_client=self._transport.client,
+                timeout=self._request_timeout,
+                reason=f"HTTP {res.status_code}",
+            )
+            return
+
+        try:
+            self._state_mgr.apply(state, res.content, res.version, "server", now)
+        except Exception as err:
+            emit_event(
+                self._logger,
+                LogLevel.ERROR,
+                "resource.load_failed",
+                resource=state.name,
+                mode=mode_name(state.mode),
+                cause=str(err),
+            )
+            raise
+
+    def start_loops(self, pull_states: list[ResourceState]) -> None:
+        """Spawn one polling thread per non-``once`` PULL resource (CONS-PULL-2/3)."""
+        for state in pull_states:
+            if state.once:
+                continue
+
+            def _run(s: ResourceState = state) -> None:
+                self._poll_loop(s)
+
+            self._spawn(_run, f"sailor-pull-{state.name}")
+
+    def _poll_loop(self, state: ResourceState) -> None:
+        """Single loop with timer and stop signal (CONS-DES-4, CONS-PULL-3)."""
+        while not self._deps.clock.wait(state.interval, self._stop):
+            self._poll_once(state)
+
+    def _poll_once(self, state: ResourceState) -> None:
+        now = self._deps.clock.now()
+        try:
+            res = self._transport.fetch_resource(
+                state.name,
+                if_none_match=state.known_version(),
+            )
+        except httpx.HTTPError as exc:
+            if not self._stop.is_set():
+                self._state_mgr.mark_stale(state, f"transport: {exc}", now)
+            return
+
+        self._state_mgr.check_encrypted_header(state, res.encrypted_header)
+        if res.status_code == 304:
+            self._state_mgr.mark_recovered(state, now)
+            return
+
+        if res.status_code == 200:
             try:
-                data = self._fetch_once(res)
-                self._on_raw(res.definition.kind, res.definition.name, data)
-            except Exception as exc:  # keep polling despite transient failures
-                self._on_error(f"pull failed for {res.definition.kind.value}: {exc}")
+                self._state_mgr.apply(state, res.content, res.version, "server", now)
+            except Exception as err:
+                self._state_mgr.note_decode_failure(state, res.content, err)
+                self._state_mgr.mark_stale(state, f"decode: {err}", now)
+                return
+            self._state_mgr.mark_recovered(state, now)
+            return
 
-    def stop(self) -> None:
-        self._stop.set()
-        for thread in self._threads:
-            thread.join(timeout=1.0)
-        self._threads.clear()
+        self._state_mgr.mark_stale(state, f"HTTP {res.status_code}", now)

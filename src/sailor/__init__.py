@@ -1,71 +1,96 @@
-"""Sailor-Py — a type-safe Python client for Sailor.
-
-Configuration and secret management for cloud-native applications. See the
-project README for usage.
-"""
+"""Sailor-Py — Python consumer for the Sailor v1 configuration & secret server."""
 
 from __future__ import annotations
 
 from . import defaults
 from .consumer import Consumer
-from .crypto import SecretRecord
+from .decode import DecodeFunc
 from .errors import (
-    ConfigsNotLoadedError,
-    DecryptionError,
-    EmptyResourceListError,
-    FetchError,
-    FetchFallbackFailedError,
+    AlreadyStartedError,
+    DecodeFailedError,
+    DecryptFailedError,
+    DuplicateResourceError,
+    EmptyResourceNameError,
+    EmptyResourcesError,
+    ErrorCode,
+    FallbackFailedError,
     InitError,
-    MiscNotLoadedError,
-    NoSailorAccessKeyError,
-    NoSailorAppError,
-    NoSailorNamespaceError,
-    NoSailorSecretKeyError,
-    NoSailorURIError,
-    NoSailorURLError,
+    InvalidFetchModeError,
+    InvalidPullIntervalError,
+    InvalidSchemeError,
+    InvalidURIError,
+    InvalidURIPrefixError,
+    LocalConfigEnvNotFoundError,
+    LocalConfigInvalidError,
+    LocalConfigNotFoundError,
+    MissingAccessKeyError,
+    MissingNamespaceAppError,
+    MissingPathComponentsError,
+    MissingSecretKeyError,
+    NoConnectionError,
     ResourceNotLoadedError,
     SailorError,
-    SecretsNotLoadedError,
+    TypeMismatchError,
+    UnsupportedLangError,
 )
+from .logger import Logger, LogLevel, StderrLogger
 from .options import (
     ConnectionOption,
     FetchDefinition,
     FetchOption,
     InitOption,
+    ResourceDecode,
     ResourceDefinition,
-    ResourceKind,
     ResourceOption,
+    raw,
+    resource,
 )
 
-__version__ = "0.1.3"
+__version__ = "1.0.0"
 
 __all__ = [
     "Consumer",
     "defaults",
-    "SecretRecord",
+    "resource",
+    "raw",
+    "DecodeFunc",
+    "ResourceDecode",
     # options
     "InitOption",
     "ConnectionOption",
     "ResourceOption",
     "ResourceDefinition",
     "FetchDefinition",
-    "ResourceKind",
     "FetchOption",
+    # logging
+    "Logger",
+    "LogLevel",
+    "StderrLogger",
     # errors
+    "ErrorCode",
     "SailorError",
     "InitError",
-    "EmptyResourceListError",
-    "NoSailorURIError",
-    "NoSailorURLError",
-    "NoSailorNamespaceError",
-    "NoSailorAppError",
-    "NoSailorAccessKeyError",
-    "NoSailorSecretKeyError",
+    "EmptyResourcesError",
+    "EmptyResourceNameError",
+    "NoConnectionError",
+    "InvalidURIError",
+    "InvalidURIPrefixError",
+    "MissingAccessKeyError",
+    "MissingSecretKeyError",
+    "MissingPathComponentsError",
+    "InvalidSchemeError",
+    "MissingNamespaceAppError",
+    "DuplicateResourceError",
+    "InvalidPullIntervalError",
+    "InvalidFetchModeError",
+    "LocalConfigNotFoundError",
+    "LocalConfigInvalidError",
+    "LocalConfigEnvNotFoundError",
+    "UnsupportedLangError",
     "ResourceNotLoadedError",
-    "ConfigsNotLoadedError",
-    "SecretsNotLoadedError",
-    "MiscNotLoadedError",
-    "FetchError",
-    "FetchFallbackFailedError",
-    "DecryptionError",
+    "FallbackFailedError",
+    "TypeMismatchError",
+    "DecodeFailedError",
+    "DecryptFailedError",
+    "AlreadyStartedError",
 ]
