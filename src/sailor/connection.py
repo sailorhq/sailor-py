@@ -1,140 +1,236 @@
-"""Resolve a fully-populated :class:`ConnectionOption`.
-
-Resolution precedence (mirrors ``sailor-go``):
-
-1. Explicit fields already set on the passed ``ConnectionOption``.
-2. A ``sailor://`` URI (either the ``uri`` field or ``SAILOR_URL`` env var).
-3. Individual environment variables.
-4. ``~/.sailor/config`` (only when ``use_sailor_config=True``).
-
-Fields resolved earlier are never overwritten by later sources.
-"""
+"""Connection resolution, URI parsing, and local config loading (CONS-CFG, CONS-URI, CONS-LOCAL)."""
 
 from __future__ import annotations
 
+import ipaddress
 import json
-import os
-from pathlib import Path
-from urllib.parse import unquote, urlparse
+from dataclasses import dataclass
+from urllib.parse import parse_qs, unquote, urlsplit
 
+from .deps import _Deps
 from .errors import (
-    NoSailorAccessKeyError,
-    NoSailorAppError,
-    NoSailorNamespaceError,
-    NoSailorSecretKeyError,
-    NoSailorURLError,
+    InvalidSchemeError,
+    InvalidURIError,
+    InvalidURIPrefixError,
+    LocalConfigEnvNotFoundError,
+    LocalConfigInvalidError,
+    LocalConfigNotFoundError,
+    MissingAccessKeyError,
+    MissingNamespaceAppError,
+    MissingPathComponentsError,
+    MissingSecretKeyError,
+    NoConnectionError,
 )
-from .options import ConnectionOption
+from .options import InitOption
 
-# SAILOR_URI is Go's canonical connection env var (a full sailor:// URI);
-# SAILOR_URL is accepted too (URI or plain base URL). SAILOR_URI wins.
+DEFAULT_SCHEME = "http"
 ENV_URI = "SAILOR_URI"
-ENV_URL = "SAILOR_URL"
-ENV_NS = "SAILOR_NS"
-ENV_APP = "SAILOR_APP"
-ENV_ACCESS_KEY = "SAILOR_ACCESS_KEY"
-ENV_SECRET_KEY = "SAILOR_SECRET_KEY"
-
-LOCAL_CONFIG_PATH = Path.home() / ".sailor" / "config"
+ENV_TOKEN = "SAILOR_TOKEN"
 
 
-def _parse_uri(uri: str) -> dict[str, str]:
-    """Parse ``sailor://accessKey:secretKey@host[:port]/namespace/app``."""
-    parsed = urlparse(uri)
-    out: dict[str, str] = {}
-    if parsed.hostname:
-        scheme = "http"
-        netloc = parsed.hostname
-        if parsed.port:
-            netloc = f"{netloc}:{parsed.port}"
-        out["addr"] = f"{scheme}://{netloc}"
-    if parsed.username:
-        out["access_key"] = unquote(parsed.username)
-    if parsed.password:
-        out["secret_key"] = unquote(parsed.password)
-    parts = [p for p in parsed.path.split("/") if p]
-    if len(parts) >= 1:
-        out["namespace"] = parts[0]
-    if len(parts) >= 2:
-        out["app"] = parts[1]
-    return out
+@dataclass(frozen=True)
+class ResolvedConnection:
+    """Validated, immutable connection resolved during Consumer construction."""
+
+    source: str  # env_uri | local_config | uri_option | fields
+    addr: str  # always includes scheme
+    namespace: str
+    app: str
+    access_key: str = ""
+    secret_key: str = ""
+    token: str = ""
+    env: str = ""
 
 
-def _from_local_config() -> dict[str, str]:
-    """Load ``~/.sailor/config`` written by the Sailor CLI (``sailor login``).
-
-    Shape matches sailor-go::
-
-        {"manifest": {"envs": [{"name": ..., "host": ...}]},
-         "env": <active env name>, "token": ..., "user": ...}
-
-    The active ``env``'s ``host`` becomes ``addr`` and ``token`` becomes the
-    bearer token. Namespace/app/keys are not in this file (they come from the
-    URI, explicit fields, or env), matching the Go client.
-    """
-    if not LOCAL_CONFIG_PATH.exists():
-        return {}
-    raw = json.loads(LOCAL_CONFIG_PATH.read_text())
-    out: dict[str, str] = {}
-    if raw.get("token"):
-        out["token"] = raw["token"]
-    active = raw.get("env")
-    if active:
-        out["env"] = active
-    envs = (raw.get("manifest") or {}).get("envs") or []
-    for entry in envs:
-        if entry.get("name") == active and entry.get("host"):
-            out["addr"] = entry["host"]
-            break
-    return out
+def normalize_addr(addr: str) -> str:
+    """Normalise an address string per CONS-URI-10..12."""
+    if not addr:
+        raise NoConnectionError("Sailor server address is empty")
+    if "://" in addr:
+        return addr
+    return f"{DEFAULT_SCHEME}://{addr}"
 
 
-def _fill(conn: ConnectionOption, source: dict[str, str]) -> None:
-    """Set any unset connection field from ``source`` (in place)."""
-    for field in ("addr", "namespace", "app", "access_key", "secret_key", "token", "env"):
-        if getattr(conn, field) is None and source.get(field):
-            setattr(conn, field, source[field])
+def is_loopback_addr(addr: str) -> bool:
+    """Return True if ``addr`` points to localhost, 127.0.0.0/8, or ::1 (CONS-URI-13)."""
+    try:
+        parts = urlsplit(addr)
+        host = parts.hostname
+    except ValueError:
+        return False
+    if not host:
+        return False
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
-def resolve_connection(
-    conn: ConnectionOption, *, use_sailor_config: bool = False
-) -> ConnectionOption:
-    """Return a validated, fully-populated connection or raise an init error."""
-    # 2. URI: explicit field, else SAILOR_URI (Go's canonical), else SAILOR_URL.
-    uri = conn.uri or os.environ.get(ENV_URI) or os.environ.get(ENV_URL)
-    if uri and uri.startswith("sailor://"):
-        _fill(conn, _parse_uri(uri))
-    elif uri and conn.addr is None:
-        # A plain URL in SAILOR_URL is treated as the address.
-        conn.addr = uri
+def parse_uri(raw: str) -> ResolvedConnection:
+    """Parse ``sailor://<ak>:<sk>@<host>[:port]/<ns>/<app>[?scheme=<http|https>]``."""
+    try:
+        parts = urlsplit(raw)
+        # Access port to trigger ValueError on malformed port specifications.
+        _ = parts.port
+    except ValueError as exc:
+        raise InvalidURIError("URI does not parse", cause=exc) from exc
 
-    # 3. Individual env vars.
-    _fill(
-        conn,
-        {
-            "namespace": os.environ.get(ENV_NS, ""),
-            "app": os.environ.get(ENV_APP, ""),
-            "access_key": os.environ.get(ENV_ACCESS_KEY, ""),
-            "secret_key": os.environ.get(ENV_SECRET_KEY, ""),
-        },
+    if parts.scheme != "sailor":
+        raise InvalidURIPrefixError(f"URI scheme must be 'sailor', got {parts.scheme!r}")
+
+    netloc = parts.netloc
+    if "@" not in netloc:
+        raise MissingAccessKeyError("URI is missing userinfo")
+    userinfo, hostport = netloc.rsplit("@", 1)
+
+    if ":" not in userinfo:
+        access_key = unquote(userinfo)
+        if not access_key:
+            raise MissingAccessKeyError("URI access key is empty")
+        raise MissingSecretKeyError("URI is missing secret key")
+
+    raw_ak, raw_sk = userinfo.split(":", 1)
+    access_key = unquote(raw_ak)
+    secret_key = unquote(raw_sk)
+    if not access_key:
+        raise MissingAccessKeyError("URI access key is empty")
+    if not secret_key:
+        raise MissingSecretKeyError("URI secret key is empty")
+
+    if not hostport:
+        raise NoConnectionError("URI has no host")
+
+    trimmed = parts.path[1:] if parts.path.startswith("/") else parts.path
+    segments = trimmed.split("/")
+    if len(segments) != 2 or not segments[0] or not segments[1]:
+        raise MissingPathComponentsError("URI path must be /<namespace>/<app>")
+
+    scheme = DEFAULT_SCHEME
+    if parts.query:
+        qs = parse_qs(parts.query, keep_blank_values=True)
+        if "scheme" in qs:
+            scheme = qs["scheme"][0]
+            if scheme not in ("http", "https"):
+                raise InvalidSchemeError("URI scheme parameter must be http or https")
+
+    return ResolvedConnection(
+        source="",
+        addr=f"{scheme}://{hostport}",
+        namespace=segments[0],
+        app=segments[1],
+        access_key=access_key,
+        secret_key=secret_key,
     )
 
-    # 4. Local config file.
-    if use_sailor_config:
-        _fill(conn, _from_local_config())
 
-    _validate(conn)
-    return conn
+def _read_local_config(deps: _Deps) -> tuple[str, str, str]:
+    """Load ``~/.sailor/config`` per section 12. Returns ``(addr, token, env)``."""
+    try:
+        home = deps.home_dir()
+        raw_bytes = deps.fs.read_bytes(home / ".sailor" / "config")
+    except OSError as exc:
+        raise LocalConfigNotFoundError("~/.sailor/config not found", cause=exc) from exc
+
+    try:
+        data = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise LocalConfigInvalidError("~/.sailor/config is not valid JSON", cause=exc) from exc
+
+    if not isinstance(data, dict):
+        raise LocalConfigInvalidError("~/.sailor/config must be a JSON object")
+
+    active_env = data.get("env") or ""
+    if not isinstance(active_env, str):
+        raise LocalConfigInvalidError("~/.sailor/config 'env' must be a string")
+
+    manifest = data.get("manifest")
+    envs = manifest.get("envs") if isinstance(manifest, dict) else None
+    if not isinstance(envs, list):
+        envs = []
+
+    tokens = data.get("tokens")
+    token = ""
+    if isinstance(tokens, dict):
+        tok_val = tokens.get(active_env)
+        if isinstance(tok_val, str):
+            token = tok_val
+
+    for entry in envs:
+        if isinstance(entry, dict) and entry.get("name") == active_env:
+            host = entry.get("host") or ""
+            if not isinstance(host, str) or not host:
+                raise NoConnectionError("local config environment host is empty")
+            return normalize_addr(host), token, active_env
+
+    raise LocalConfigEnvNotFoundError(
+        f"active environment {active_env!r} is not in local config manifest"
+    )
 
 
-def _validate(conn: ConnectionOption) -> None:
-    if not conn.addr:
-        raise NoSailorURLError("Sailor server address is not set")
-    if not conn.namespace:
-        raise NoSailorNamespaceError("Sailor namespace is not set")
-    if not conn.app:
-        raise NoSailorAppError("Sailor app is not set")
-    if not conn.access_key:
-        raise NoSailorAccessKeyError("Sailor access key is not set")
-    if not conn.secret_key:
-        raise NoSailorSecretKeyError("Sailor secret key is not set")
+def resolve_connection(init: InitOption, *, deps: _Deps | None = None) -> ResolvedConnection:
+    """Resolve connection following the exclusive precedence in CONS-CFG-4..8."""
+    d = deps if deps is not None else _Deps()
+
+    env_uri = d.getenv(ENV_URI)
+    if env_uri:
+        parsed = parse_uri(env_uri)
+        return ResolvedConnection(
+            source="env_uri",
+            addr=parsed.addr,
+            namespace=parsed.namespace,
+            app=parsed.app,
+            access_key=parsed.access_key,
+            secret_key=parsed.secret_key,
+            token=d.getenv(ENV_TOKEN),
+            env=init.connection.env or "",
+        )
+
+    conn = init.connection
+    if init.use_local_config:
+        if not conn.namespace or not conn.app:
+            raise MissingNamespaceAppError(
+                "namespace and app must be set when use_local_config is True"
+            )
+        addr, file_token, active_env = _read_local_config(d)
+        return ResolvedConnection(
+            source="local_config",
+            addr=addr,
+            namespace=conn.namespace,
+            app=conn.app,
+            access_key=conn.access_key or "",
+            secret_key=conn.secret_key or "",
+            token=conn.token or file_token,
+            env=conn.env or active_env,
+        )
+
+    if conn.uri:
+        parsed = parse_uri(conn.uri)
+        token = conn.token or d.getenv(ENV_TOKEN)
+        return ResolvedConnection(
+            source="uri_option",
+            addr=parsed.addr,
+            namespace=parsed.namespace,
+            app=parsed.app,
+            access_key=parsed.access_key,
+            secret_key=parsed.secret_key,
+            token=token,
+            env=conn.env or "",
+        )
+
+    if conn.addr:
+        if not conn.namespace or not conn.app:
+            raise MissingNamespaceAppError("namespace and app must be set with addr")
+        return ResolvedConnection(
+            source="fields",
+            addr=normalize_addr(conn.addr),
+            namespace=conn.namespace,
+            app=conn.app,
+            access_key=conn.access_key or "",
+            secret_key=conn.secret_key or "",
+            token=conn.token or "",
+            env=conn.env or "",
+        )
+
+    raise NoConnectionError("no Sailor connection source configured")
