@@ -1,184 +1,335 @@
-"""The :class:`Consumer` — the public entry point of the Sailor client.
-
-Usage mirrors ``sailor-go``'s generic ``Consumer[C, S]``. Because Python type
-parameters are not available at runtime, the concrete Pydantic models are passed
-explicitly via ``config_type`` and ``secrets_type``.
-
-    consumer = Consumer[AppConfig, AppSecrets](
-        init_option,
-        config_type=AppConfig,
-        secrets_type=AppSecrets,
-    )
-    consumer.start()
-    cfg = consumer.get()
-
-Current values are held behind a lock and swapped atomically, so ``get`` /
-``get_secret`` / ``get_misc`` are safe to call from any thread while background
-polling or file-watching updates them.
-"""
+"""The :class:`Consumer` — public entry point of the Sailor v1 client."""
 
 from __future__ import annotations
 
-import json
 import threading
-from typing import Generic, TypeVar
+from typing import Any, Callable, TypeVar, overload
 
-from pydantic import BaseModel
-
-from .connection import resolve_connection
-from .crypto import decrypt_secrets
+from .connection import is_loopback_addr, resolve_connection
+from .decode import DecoderSet, normalize_lang
+from .deps import _Deps
 from .dev import DevReader
 from .errors import (
-    ConfigsNotLoadedError,
-    EmptyResourceListError,
-    MiscNotLoadedError,
-    SecretsNotLoadedError,
+    AlreadyStartedError,
+    DuplicateResourceError,
+    EmptyResourceNameError,
+    EmptyResourcesError,
+    InvalidFetchModeError,
+    InvalidPullIntervalError,
+    ResourceNotLoadedError,
+    TypeMismatchError,
 )
-from .options import FetchOption, InitOption, ResourceKind
+from .logger import Logger, LogLevel, StderrLogger, emit_event, redact_url
+from .options import (
+    DEFAULT_PULL_INTERVAL_SECONDS,
+    DEFAULT_REPORT_TIMEOUT_SECONDS,
+    DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    MIN_PULL_INTERVAL_SECONDS,
+    FetchOption,
+    InitOption,
+    ResourceOption,
+)
 from .pull import Poller
+from .report import Reporter
+from .state import ResourceState, StateManager
 from .transport import Transport
-from .volume import VolumeReader
+from .volume import DirectoryWatcher, VolumeReader
 
-C = TypeVar("C", bound=BaseModel)
-S = TypeVar("S", bound=BaseModel)
+T = TypeVar("T")
 
 
-class Consumer(Generic[C, S]):
-    """Loads and keeps fresh a Sailor app's config, secrets, and misc blobs."""
+def _build_state(ro: ResourceOption) -> ResourceState:
+    name = ro.definition.name
+    if not name:
+        raise EmptyResourceNameError("resource definition name must not be empty")
 
-    def __init__(
-        self,
-        init: InitOption,
-        *,
-        config_type: type[C] | None = None,
-        secrets_type: type[S] | None = None,
-    ) -> None:
+    interval = ro.fetch_def.pull_interval
+    if interval < 0:
+        raise InvalidPullIntervalError(f"resource {name!r} has a negative pull_interval")
+    if interval == 0:
+        interval = DEFAULT_PULL_INTERVAL_SECONDS
+    elif interval < MIN_PULL_INTERVAL_SECONDS:
+        raise InvalidPullIntervalError(
+            f"resource {name!r} pull_interval is below {MIN_PULL_INTERVAL_SECONDS}s"
+        )
+
+    mode = ro.fetch_def.fetch
+    if mode is FetchOption.VOLUME:
+        if not ro.definition.path:
+            raise InvalidFetchModeError(f"resource {name!r} is VOLUME but has no path")
+    elif mode not in (FetchOption.PULL, FetchOption.DEV):
+        raise InvalidFetchModeError(f"resource {name!r} has invalid fetch mode {mode!r}")
+
+    lang = "json" if ro.definition.encrypted else normalize_lang(ro.definition.lang)
+    return ResourceState(
+        name=name,
+        mode=mode,
+        once=ro.fetch_def.once,
+        interval=interval,
+        encrypted=ro.definition.encrypted,
+        dir=ro.definition.path,
+        lang=lang,
+        decode=ro.decode,
+    )
+
+
+class Consumer:
+    """Keeps named Sailor resources current in memory (SAILOR_CONSUMER.md)."""
+
+    def __init__(self, init: InitOption, *, _deps: _Deps | None = None) -> None:
         if not init.resources:
-            raise EmptyResourceListError("InitOption.resources must not be empty")
+            raise EmptyResourcesError("InitOption.resources must not be empty")
 
-        self._init = init
-        self._config_type = config_type
-        self._secrets_type = secrets_type
+        deps = _deps if _deps is not None else _Deps()
+        by_name: dict[str, ResourceState] = {}
+        ordered: list[ResourceState] = []
+        for ro in init.resources:
+            state = _build_state(ro)
+            if state.name in by_name:
+                raise DuplicateResourceError(f"resource {state.name!r} is declared twice")
+            by_name[state.name] = state
+            ordered.append(state)
 
-        self._conn = resolve_connection(init.connection, use_sailor_config=init.use_sailor_config)
+        conn = resolve_connection(init, deps=deps)
+        logger: Logger = init.logger if init.logger is not None else StderrLogger()
+        decoders = DecoderSet(init.decoders)
 
-        self._lock = threading.RLock()
-        self._config: C | None = None
-        self._secrets: S | None = None
-        self._misc: dict[str, bytes] = {}
+        self._deps = deps
+        self._conn = conn
+        self._logger = logger
+        self._decoders = decoders
+        self._states = ordered
+        self._by_name = by_name
+        self._watch = True if init.watch is None else init.watch
+        self._request_timeout = (
+            init.request_timeout if init.request_timeout > 0 else DEFAULT_REQUEST_TIMEOUT_SECONDS
+        )
+        self._report_timeout = (
+            init.report_timeout if init.report_timeout > 0 else DEFAULT_REPORT_TIMEOUT_SECONDS
+        )
+        self._http_client = init.http_client
+
+        self._lifecycle_lock = threading.Lock()
+        self._threads_lock = threading.Lock()
+        self._threads: set[threading.Thread] = set()
+        self._stop_event = threading.Event()
+        self._started = False
+        self._closed = False
+        self._started_at = 0.0
 
         self._transport: Transport | None = None
-        self._poller: Poller | None = None
-        self._volume: VolumeReader | None = None
-        self._dev: DevReader | None = None
-        self._started = False
+        self._dir_watcher: DirectoryWatcher | None = None
 
-    # -- lifecycle ----------------------------------------------------------
+        if conn.token and conn.addr.startswith("http://") and not is_loopback_addr(conn.addr):
+            emit_event(
+                logger,
+                LogLevel.WARN,
+                "config.insecure_transport",
+                host=redact_url(conn.addr),
+            )
+        emit_event(
+            logger,
+            LogLevel.INFO,
+            "config.resolved",
+            source=conn.source,
+            addr=redact_url(conn.addr),
+            namespace=conn.namespace,
+            app=conn.app,
+            token=bool(conn.token),
+            resources=len(ordered),
+        )
+
+    def _spawn(self, target: Callable[[], None], name: str) -> None:
+        thread_holder: list[threading.Thread] = []
+
+        def _runner() -> None:
+            try:
+                target()
+            finally:
+                with self._threads_lock:
+                    if thread_holder:
+                        self._threads.discard(thread_holder[0])
+
+        thread = threading.Thread(target=_runner, name=name, daemon=True)
+        thread_holder.append(thread)
+        with self._threads_lock:
+            if self._closed or self._stop_event.is_set():
+                return
+            self._threads.add(thread)
+            thread.start()
 
     def start(self) -> None:
-        """Perform initial fetches and launch any background pollers/watchers."""
-        if self._started:
-            return
+        """Load every resource once and start background pollers/watchers/heartbeats."""
+        with self._lifecycle_lock:
+            if self._started:
+                raise AlreadyStartedError("start() has already been called")
+            if self._closed:
+                raise AlreadyStartedError("consumer is closed")
+            self._started = True
+            self._started_at = self._deps.clock.now()
 
-        resources = self._init.resources
-        needs_pull = any(r.fetch_def.fetch is FetchOption.PULL for r in resources)
-        needs_volume = any(r.fetch_def.fetch is FetchOption.VOLUME for r in resources)
-        needs_dev = any(r.fetch_def.fetch is FetchOption.DEV for r in resources)
-        watch = True if self._init.watch is None else self._init.watch
+        transport = Transport(
+            self._conn,
+            http_client=self._http_client,
+            request_timeout=self._request_timeout,
+            report_timeout=self._report_timeout,
+        )
+        self._transport = transport
 
-        # DEV (cache miss) and PULL both fetch over HTTP — share one transport.
-        if needs_pull or needs_dev:
-            transport = Transport(self._conn)
-            self._transport = transport
+        reporter = Reporter(
+            self._conn,
+            transport,
+            self._deps,
+            self._logger,
+            self._stop_event,
+            self._spawn,
+        )
+        state_mgr = StateManager(
+            self._conn,
+            self._decoders,
+            self._logger,
+            reporter.report_async,
+        )
 
-            if needs_pull:
-                self._poller = Poller(transport, self._conn, self._store_raw, self._log)
-                self._poller.start(resources)
+        if not self._conn.token:
+            for s in self._states:
+                reporter.log_no_token(s)
 
-            if needs_dev:
-                self._dev = DevReader(transport, self._conn, self._store_raw, self._log)
-                self._dev.start(resources, watch=watch)
+        poller = Poller(
+            transport,
+            self._conn,
+            state_mgr,
+            self._deps,
+            self._logger,
+            self._stop_event,
+            self._spawn,
+            request_timeout=self._request_timeout,
+        )
+        volume_reader = VolumeReader(
+            self._conn,
+            state_mgr,
+            self._deps,
+            self._logger,
+            http_client=transport.client,
+            request_timeout=self._request_timeout,
+        )
+        dev_reader = DevReader(
+            transport,
+            self._conn,
+            state_mgr,
+            self._deps,
+            self._logger,
+        )
 
-        if needs_volume:
-            self._volume = VolumeReader(self._conn, self._store_raw, self._log)
-            self._volume.start(resources, watch=watch)
+        try:
+            for s in self._states:
+                if s.mode is FetchOption.PULL:
+                    poller.load_initial(s)
+                elif s.mode is FetchOption.VOLUME:
+                    volume_reader.load_initial(s)
+                else:
+                    dev_reader.load_initial(s)
+        except Exception:
+            self._stop_event.set()
+            self._join_threads()
+            transport.close()
+            self._transport = None
+            raise
 
-        self._started = True
+        def _reread(state: ResourceState) -> None:
+            if state.mode is FetchOption.VOLUME:
+                volume_reader.reread(state)
+            elif state.mode is FetchOption.DEV:
+                dev_reader.reread(state)
+
+        if self._watch:
+            watcher = DirectoryWatcher(
+                self._states,
+                self._deps,
+                self._logger,
+                self._stop_event,
+                self._spawn,
+                _reread,
+            )
+            self._dir_watcher = watcher
+            watcher.start()
+
+        pull_states = [s for s in self._states if s.mode is FetchOption.PULL]
+        poller.start_loops(pull_states)
+
+        for s in self._states:
+
+            def _hb(st: ResourceState = s) -> None:
+                reporter.heartbeat_loop(st)
+
+            self._spawn(_hb, f"sailor-heartbeat-{s.name}")
+
+        emit_event(self._logger, LogLevel.INFO, "consumer.started", resources=len(self._states))
+
+    def _join_threads(self) -> None:
+        while True:
+            with self._threads_lock:
+                pending = list(self._threads)
+            if not pending:
+                return
+            for thread in pending:
+                thread.join()
 
     def close(self) -> None:
-        """Stop all background activity and release resources."""
-        if self._poller is not None:
-            self._poller.stop()
-        if self._volume is not None:
-            self._volume.stop()
-        if self._dev is not None:
-            self._dev.stop()
-        if self._transport is not None:
-            self._transport.close()
-        self._started = False
+        """Stop all background threads and watchers; idempotent (CONS-CONC-4)."""
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
+            started = self._started
+            started_at = self._started_at
+            watcher = self._dir_watcher
+            self._dir_watcher = None
+            transport = self._transport
+            self._transport = None
 
-    def __enter__(self) -> Consumer[C, S]:
+        self._stop_event.set()
+        if watcher is not None:
+            watcher.stop()
+        self._join_threads()
+        if transport is not None:
+            transport.close()
+
+        if started:
+            uptime = int(max(0.0, self._deps.clock.now() - started_at))
+            emit_event(
+                self._logger,
+                LogLevel.INFO,
+                "consumer.stopped",
+                resources=len(self._states),
+                uptime_seconds=uptime,
+            )
+
+    def __enter__(self) -> Consumer:
         self.start()
         return self
 
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    # -- accessors ----------------------------------------------------------
+    @overload
+    def get(self, name: str, expected_type: type[T]) -> T: ...
 
-    def get(self) -> C:
-        """Return the current config, or raise :class:`ConfigsNotLoadedError`."""
-        with self._lock:
-            if self._config is None:
-                raise ConfigsNotLoadedError("config resource is not loaded")
-            return self._config
+    @overload
+    def get(self, name: str) -> Any: ...
 
-    def get_secret(self) -> S:
-        """Return the current secrets, or raise :class:`SecretsNotLoadedError`."""
-        with self._lock:
-            if self._secrets is None:
-                raise SecretsNotLoadedError("secret resource is not loaded")
-            return self._secrets
+    def get(self, name: str, expected_type: type[T] | None = None) -> T | Any:
+        """Return the current value of ``name``, checking ``expected_type`` if given."""
+        state = self._by_name.get(name)
+        if state is None:
+            raise ResourceNotLoadedError(f"no resource named {name!r} is declared")
+        with state.lock:
+            if not state.loaded:
+                raise ResourceNotLoadedError(f"resource {name!r} has no value yet")
+            val = state.value
 
-    def get_misc(self, name: str) -> bytes:
-        """Return raw bytes of a misc resource, or raise :class:`MiscNotLoadedError`."""
-        with self._lock:
-            if name not in self._misc:
-                raise MiscNotLoadedError(f"misc resource {name!r} is not loaded")
-            return self._misc[name]
-
-    # -- internal store -----------------------------------------------------
-
-    def _store_raw(self, kind: ResourceKind, name: str, data: bytes) -> None:
-        """Parse fetched bytes into the typed snapshot and swap atomically."""
-        if kind is ResourceKind.CONFIGS:
-            parsed = self._parse_model(data, self._config_type)
-            with self._lock:
-                self._config = parsed
-        elif kind is ResourceKind.SECRETS:
-            parsed = self._parse_secrets(data)
-            with self._lock:
-                self._secrets = parsed
-        else:  # MISC
-            with self._lock:
-                self._misc[name] = data
-
-    def _parse_model(self, data: bytes, model: type[BaseModel] | None):  # type: ignore[no-untyped-def]
-        if model is None:
-            return json.loads(data)
-        return model.model_validate_json(data)
-
-    def _parse_secrets(self, data: bytes):  # type: ignore[no-untyped-def]
-        encrypted = json.loads(data)
-        plaintext = decrypt_secrets(
-            encrypted,
-            secret_key=self._conn.secret_key or "",
-            access_key=self._conn.access_key or "",
-        )
-        if self._secrets_type is None:
-            return plaintext
-        return self._secrets_type.model_validate(plaintext)
-
-    def _log(self, message: str) -> None:
-        if self._init.logging:
-            print(f"[sailor] {message}")  # noqa: T201 — opt-in dev logging
+        if expected_type is not None and not isinstance(val, expected_type):
+            raise TypeMismatchError(
+                f"resource {name!r} holds {type(val).__name__}, not {expected_type.__name__}"
+            )
+        return val

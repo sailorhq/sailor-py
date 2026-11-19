@@ -10,7 +10,6 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from sailor.crypto import NONCE_SIZE, derive_kek
 
-# Deterministic 12-byte nonce for reproducible fixtures.
 _TEST_NONCE = bytes(range(NONCE_SIZE))
 
 

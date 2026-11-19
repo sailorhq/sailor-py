@@ -1,35 +1,25 @@
-"""Configuration option models, mirroring ``sailor-go``'s ``pkg/opts``.
-
-Go field names are mapped to snake_case. Enum values match the wire/library
-constants used by Sailor exactly.
-"""
+"""Configuration option models for the Sailor v1 consumer."""
 
 from __future__ import annotations
 
 # ruff: noqa: UP045, UP007
-from enum import Enum, IntEnum
-from typing import Optional
+from enum import IntEnum
+from typing import Any, Callable, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-# Default mounted volume paths (match sailor-go defaults).
-DEFAULT_CONFIG_VOLUME_PATH = "/etc/sailor/_config"
-DEFAULT_SECRET_VOLUME_PATH = "/etc/sailor/secret/_secret"
+from .decode import DecodeFunc
 
-# Default polling interval for PULL resources.
 DEFAULT_PULL_INTERVAL_SECONDS = 10.0
+MIN_PULL_INTERVAL_SECONDS = 1.0
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 10.0
+DEFAULT_REPORT_TIMEOUT_SECONDS = 5.0
 
-
-class ResourceKind(str, Enum):
-    """Kind of resource managed by Sailor (matches Go string constants)."""
-
-    CONFIGS = "config"
-    SECRETS = "secret"
-    MISC = "misc"
+ResourceDecode = Callable[[bytes, DecodeFunc], Any]
 
 
 class FetchOption(IntEnum):
-    """How a resource is retrieved (matches Go integer constants)."""
+    """How a resource is retrieved (SAILOR_CONSUMER.md section 7)."""
 
     VOLUME = 1
     PULL = 2
@@ -37,7 +27,7 @@ class FetchOption(IntEnum):
 
 
 class _Model(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
 
 class ConnectionOption(_Model):
@@ -51,14 +41,14 @@ class ConnectionOption(_Model):
     secret_key: Optional[str] = None
     token: Optional[str] = None
     env: Optional[str] = None
-    socket_timeout: float = 30.0
 
 
 class ResourceDefinition(_Model):
-    """Identifies a resource: its kind, optional misc name, and volume path."""
+    """Identifies a resource and its format/storage attributes."""
 
-    kind: ResourceKind
-    name: str = ""
+    name: str
+    lang: str = "json"
+    encrypted: bool = False
     path: str = ""
 
 
@@ -71,21 +61,58 @@ class FetchDefinition(_Model):
 
 
 class ResourceOption(_Model):
-    """A single resource to manage, its fetch strategy, and fallback flag."""
+    """A single resource to manage and its optional decode hook."""
 
     definition: ResourceDefinition
     fetch_def: FetchDefinition = Field(default_factory=FetchDefinition)
-    fallback_enabled: bool = False
+    decode: Optional[ResourceDecode] = None
 
 
 class InitOption(_Model):
     """Top-level options passed to :class:`~sailor.consumer.Consumer`."""
 
-    # Optional: an empty ConnectionOption is filled in from SAILOR_URI / the
-    # SAILOR_* env vars / ~/.sailor/config during connection resolution, so
-    # InitOption(resources=[...]) works when the connection lives in the env.
     connection: ConnectionOption = Field(default_factory=ConnectionOption)
     resources: list[ResourceOption]
-    logging: bool = False
+    use_local_config: bool = False
     watch: Optional[bool] = None
-    use_sailor_config: bool = False
+    request_timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
+    report_timeout: float = DEFAULT_REPORT_TIMEOUT_SECONDS
+    logger: Optional[Any] = None
+    http_client: Optional[Any] = None
+    decoders: Optional[dict[str, DecodeFunc]] = None
+
+
+def resource(
+    definition: ResourceDefinition,
+    fetch_def: FetchDefinition | None = None,
+    *,
+    model: type[BaseModel] | None = None,
+    decode: ResourceDecode | None = None,
+) -> ResourceOption:
+    """Declare a decoded resource, optionally validating into a Pydantic ``model``."""
+    fd = fetch_def if fetch_def is not None else FetchDefinition()
+    if decode is not None:
+        decode_fn = decode
+    elif model is not None:
+
+        def _decode_model(raw_bytes: bytes, lang_decode: DecodeFunc) -> Any:
+            return model.model_validate(lang_decode(raw_bytes))
+
+        decode_fn = _decode_model
+    else:
+
+        def _decode_plain(raw_bytes: bytes, lang_decode: DecodeFunc) -> Any:
+            return lang_decode(raw_bytes)
+
+        decode_fn = _decode_plain
+
+    return ResourceOption(definition=definition, fetch_def=fd, decode=decode_fn)
+
+
+def raw(
+    definition: ResourceDefinition,
+    fetch_def: FetchDefinition | None = None,
+) -> ResourceOption:
+    """Declare a raw resource stored as ``bytes`` with no decoding (CONS-CONC-11)."""
+    fd = fetch_def if fetch_def is not None else FetchDefinition()
+    return ResourceOption(definition=definition, fetch_def=fd, decode=None)

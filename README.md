@@ -1,17 +1,15 @@
 # 🐧 Sailor Python - Consumer
 
 A type-safe Python client for [Sailor](https://github.com/sailorhq/sailor) —
-configuration and secret management for cloud-native applications. This is the
-Python counterpart to [`sailor-go`](https://github.com/sailorhq/sailor-go) and
-speaks the same wire protocol.
+configuration and secret management for cloud-native applications. Conforms to the
+Sailor v1 Consumer Specification (`SAILOR_CONSUMER.md`).
 
-- **Typed** config & secrets via Pydantic v2 models
-- **Two fetch modes**: `PULL` (poll the Sailor API) and `VOLUME` (read mounted
-  ConfigMaps/Secrets, hot-reloaded via a file watcher)
-- **End-to-end secret decryption** — envelope decryption (HKDF-SHA256 KEK →
-  per-record DEK → AES-256-GCM), compatible with the Sailor server's vault
-- **Fallback** to a local/remote snapshot when the server is unreachable
-- Flexible connection config: URI, explicit options, env vars, or `~/.sailor/config`
+- **Typed** config & secrets via Pydantic v2 models (`resource(..., model=...)` and `consumer.get(name, Type)`)
+- **Three fetch modes**: `PULL` (poll the Sailor API), `VOLUME` (read mounted directories with 500 ms debounced reloads), and `DEV` (cached local development with `.meta.json` sidecar & override detection)
+- **End-to-end secret decryption** — envelope decryption (HKDF-SHA256 KEK → per-record DEK → AES-256-GCM)
+- **Fallback** to HTTP snapshot (`SAILOR_FALLBACK_BASE_URL/{app}-{name}.sailor.fall`) when initial VOLUME or PULL fetch fails
+- **Consumer reporting** — async change reports and 10-minute heartbeats when a token is configured
+- **Structured redacted logging** — injectable `Logger` protocol with default stderr output
 
 ## Install
 
@@ -38,117 +36,90 @@ class AppSecrets(BaseModel):
 
 
 init = InitOption(
-    connection=ConnectionOption(uri="sailor://ACCESS:SECRET@sailor.example.com/team/billing"),
+    connection=ConnectionOption(
+        uri="sailor://ACCESS:SECRET@sailor.example.com/team/billing?scheme=https",
+        token="app-token",
+    ),
     resources=[
-        defaults.config_pull_default(),      # poll config every 10s
-        defaults.secrets_pull_default(),     # poll + decrypt secrets
-        defaults.misc_pull_default("flags"), # arbitrary blob
+        defaults.config_pull_default(AppConfig),       # poll "config" every 10s
+        defaults.secrets_pull_default(AppSecrets),     # poll + decrypt "secret"
+        defaults.misc_pull_default("flags"),           # raw bytes blob
     ],
 )
 
-with Consumer[AppConfig, AppSecrets](
-    init, config_type=AppConfig, secrets_type=AppSecrets
-) as consumer:
-    cfg = consumer.get()               # -> AppConfig
-    secrets = consumer.get_secret()    # -> AppSecrets (decrypted)
-    flags = consumer.get_misc("flags") # -> bytes
+with Consumer(init) as consumer:
+    cfg = consumer.get("config", AppConfig)      # -> AppConfig
+    secrets = consumer.get("secret", AppSecrets) # -> AppSecrets (decrypted)
+    flags = consumer.get("flags", bytes)         # -> bytes
 
     print(cfg.database_url, secrets.api_key)
 ```
 
-`Consumer` starts background threads to keep values fresh; `get()` /
-`get_secret()` / `get_misc()` always return the latest snapshot and are
-thread-safe. Use it as a context manager (as above) or call `.start()` /
-`.close()` explicitly.
+`Consumer` starts background threads to keep values fresh; `get(name, expected_type)`
+always returns the latest snapshot and is thread-safe. Use it as a context manager
+(as above) or call `.start()` / `.close()` explicitly.
 
 ## Volume mode (Kubernetes mounts)
 
 ```python
 init = InitOption(
-    connection=ConnectionOption(namespace="team", app="billing", access_key="AK", secret_key="SK"),
     resources=[
-        defaults.config_map_default(),   # reads /etc/sailor/_config
-        defaults.secrets_default(),      # reads /etc/sailor/_secret
+        defaults.config_map_default(AppConfig),   # reads /etc/sailor/_config
+        defaults.secrets_default(AppSecrets),     # reads /etc/sailor/secret/_secret
     ],
-    watch=True,  # hot-reload on file change (default when volumes are used)
+    watch=True,  # hot-reload on directory changes (default True)
 )
 ```
+
+Connection is resolved automatically from `SAILOR_URI` (and `SAILOR_TOKEN` if set).
 
 ## Dev mode
 
-`config_dev_default()` / `secrets_dev_default()` (fetch strategy `DEV`) support
-local iteration: on first run they fetch from the API once and cache the
-response to `~/.sailor/cache/{ns}-{app}-{env}-{kind}.json`; thereafter they read
-that cache and **watch it for edits**, so you can tweak a local JSON copy and get
-live reload without a server round-trip.
+`config_dev_default()` / `secrets_dev_default()` cache responses to
+`~/.sailor/cache/{ns}-{app}-{env}-{name}.json` with a `.meta.json` sidecar,
+revalidating pristine caches at start and preserving local edits (`resource.local_override`).
 
 ```python
 init = InitOption(
-    connection=ConnectionOption(uri="sailor://AK:SK@host/team/billing"),
-    resources=[defaults.config_dev_default(), defaults.secrets_dev_default()],
+    use_local_config=True,
+    connection=ConnectionOption(namespace="team", app="billing"),
+    resources=[defaults.config_dev_default(AppConfig), defaults.secrets_dev_default(AppSecrets)],
 )
 ```
 
-## Connection resolution
+## Connection precedence
 
-Fields are resolved in this order (earlier wins, never overwritten):
+Connection is chosen by the first matching rule (never merged across sources):
 
-1. Explicit `ConnectionOption` fields
-2. `sailor://accessKey:secretKey@host/namespace/app` URI — `uri` field, else
-   `SAILOR_URI` (the canonical env var), else `SAILOR_URL` (URI or plain base URL)
-3. Environment: `SAILOR_NS`, `SAILOR_APP`, `SAILOR_ACCESS_KEY`, `SAILOR_SECRET_KEY`
-4. `~/.sailor/config` written by the Sailor CLI (only when `use_sailor_config=True`)
-
-The optional bearer token is sent as the `x-token` header.
+1. `SAILOR_URI` env var (`sailor://<ak>:<sk>@<host>[:port]/<ns>/<app>[?scheme=http|https]`) + `SAILOR_TOKEN`
+2. `use_local_config=True` (`~/.sailor/config`, requiring `namespace` and `app`; caller `token` overrides file token)
+3. `ConnectionOption.uri` (`token` field, else `SAILOR_TOKEN`)
+4. `ConnectionOption.addr` (requires `namespace` and `app`; `SAILOR_TOKEN` is ignored)
 
 ## Fallback
 
-Set `fallback_enabled=True` on a resource and point `SAILOR_FALLBACK_BASE_URL`
-at a directory or `http(s)://` base. On fetch failure the client reads
-`{base}/{app}-{kind}.sailor.fall`.
+On initial `VOLUME` or `PULL` failure, the consumer fetches `{SAILOR_FALLBACK_BASE_URL}/{app}-{name}.sailor.fall` without `x-token` and requires HTTP `200`.
 
 ## API surface
 
-| Go (`sailor-go`)              | Python (`sailor-py`)                              |
-| ----------------------------- | ------------------------------------------------- |
-| `NewConsumer[C,S](opts)`      | `Consumer[C,S](init, config_type=, secrets_type=)`|
-| `Start()`                     | `start()` (or `with Consumer(...)`)               |
-| `Get()` / `GetSecret()`       | `get()` / `get_secret()`                          |
-| `GetMisc(name)`               | `get_misc(name)`                                  |
-| `opts.*` structs              | `sailor.options.*` Pydantic models                |
-| `defaults.*`                  | `sailor.defaults.*`                               |
-
-Errors are Python exceptions under `sailor.SailorError` (e.g.
-`ConfigsNotLoadedError`, `FetchFallbackFailedError`, `DecryptionError`) — catch
-by type instead of Go's `errors.Is`.
+| Symbol | Role |
+|---|---|
+| `Consumer(init)` | Validate config and resolve connection (no network/threads) |
+| `consumer.start()` | Load all resources initially and start background pollers/watchers/heartbeats |
+| `consumer.get(name, expected_type)` | Return current typed value or raise `ResourceNotLoadedError` / `TypeMismatchError` |
+| `consumer.close()` | Idempotently stop and join all background threads and watchers |
+| `resource(...)` / `raw(...)` | Declare custom named or raw-bytes resources |
+| `sailor.defaults.*` | Standard constructors (`config_map_default`, `secrets_default`, `config_pull_default`, `secrets_pull_default`, `config_dev_default`, `secrets_dev_default`, `misc_pull_default`) |
+| `SailorError` / `ErrorCode` | Typed exceptions carrying stable `.code` strings |
 
 ## Development
 
 ```bash
 uv venv && uv pip install -e ".[dev]"
-uv run pytest        # tests
+uv run pytest -q     # tests
 uv run ruff check .  # lint
 uv run mypy          # types
 ```
-
-## Releasing
-
-Releases publish to PyPI automatically via
-[`.github/workflows/publish.yml`](.github/workflows/publish.yml) using PyPI
-**Trusted Publishing** (OIDC) — no API tokens or repository secrets.
-
-One-time PyPI setup: create the project's *pending publisher* pointing at this
-repo, the `publish.yml` workflow, and a `pypi` environment.
-
-To cut a release, bump `version` in `pyproject.toml`, then tag and push:
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-The tag triggers a build (`uv build`) and upload. Test the flow first with
-TestPyPI or `twine check dist/*` locally.
 
 ## License
 

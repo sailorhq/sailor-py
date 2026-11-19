@@ -1,96 +1,100 @@
-"""Convenience constructors for common :class:`ResourceOption` shapes.
-
-Mirrors ``sailor-go``'s ``defaults.go`` helpers.
-"""
+"""Standard resource constructors (SAILOR_CONSUMER.md section 4.1)."""
 
 from __future__ import annotations
 
+from pydantic import BaseModel
+
 from .options import (
-    DEFAULT_CONFIG_VOLUME_PATH,
     DEFAULT_PULL_INTERVAL_SECONDS,
-    DEFAULT_SECRET_VOLUME_PATH,
     FetchDefinition,
     FetchOption,
     ResourceDefinition,
-    ResourceKind,
     ResourceOption,
+    raw,
+    resource,
 )
 
-# --- VOLUME defaults --------------------------------------------------------
+CONFIG_MOUNT_PATH = "/etc/sailor"
+SECRET_MOUNT_PATH = "/etc/sailor/secret"
 
 
-def config_map_default(path: str = DEFAULT_CONFIG_VOLUME_PATH) -> ResourceOption:
-    """CONFIGS read from a mounted volume."""
-    return ResourceOption(
-        definition=ResourceDefinition(kind=ResourceKind.CONFIGS, path=path),
-        fetch_def=FetchDefinition(fetch=FetchOption.VOLUME),
+def config_map_default(
+    model: type[BaseModel] | None = None,
+    *,
+    path: str = CONFIG_MOUNT_PATH,
+) -> ResourceOption:
+    """Resource ``config`` read from a mounted VOLUME directory."""
+    return resource(
+        ResourceDefinition(name="config", path=path),
+        FetchDefinition(fetch=FetchOption.VOLUME),
+        model=model,
     )
 
 
-def secrets_default(path: str = DEFAULT_SECRET_VOLUME_PATH) -> ResourceOption:
-    """SECRETS read from a mounted volume."""
-    return ResourceOption(
-        definition=ResourceDefinition(kind=ResourceKind.SECRETS, path=path),
-        fetch_def=FetchDefinition(fetch=FetchOption.VOLUME),
+def secrets_default(
+    model: type[BaseModel] | None = None,
+    *,
+    path: str = SECRET_MOUNT_PATH,
+) -> ResourceOption:
+    """Encrypted resource ``secret`` read from a mounted VOLUME directory."""
+    return resource(
+        ResourceDefinition(name="secret", encrypted=True, path=path),
+        FetchDefinition(fetch=FetchOption.VOLUME),
+        model=model,
     )
-
-
-# --- PULL defaults ----------------------------------------------------------
 
 
 def config_pull_default(
+    model: type[BaseModel] | None = None,
+    *,
     interval: float = DEFAULT_PULL_INTERVAL_SECONDS,
 ) -> ResourceOption:
-    """CONFIGS pulled from the Sailor API on an interval."""
-    return ResourceOption(
-        definition=ResourceDefinition(kind=ResourceKind.CONFIGS),
-        fetch_def=FetchDefinition(fetch=FetchOption.PULL, pull_interval=interval),
+    """Resource ``config`` polled from the Sailor API on an interval."""
+    return resource(
+        ResourceDefinition(name="config"),
+        FetchDefinition(fetch=FetchOption.PULL, pull_interval=interval),
+        model=model,
     )
 
 
 def secrets_pull_default(
+    model: type[BaseModel] | None = None,
+    *,
     interval: float = DEFAULT_PULL_INTERVAL_SECONDS,
 ) -> ResourceOption:
-    """SECRETS pulled from the Sailor API on an interval."""
-    return ResourceOption(
-        definition=ResourceDefinition(kind=ResourceKind.SECRETS),
-        fetch_def=FetchDefinition(fetch=FetchOption.PULL, pull_interval=interval),
+    """Encrypted resource ``secret`` polled from the Sailor API on an interval."""
+    return resource(
+        ResourceDefinition(name="secret", encrypted=True),
+        FetchDefinition(fetch=FetchOption.PULL, pull_interval=interval),
+        model=model,
     )
 
 
-# --- DEV defaults -----------------------------------------------------------
-
-
-def config_dev_default() -> ResourceOption:
-    """CONFIGS in DEV mode: fetch once, cache to ~/.sailor/cache, live-reload."""
-    return ResourceOption(
-        definition=ResourceDefinition(kind=ResourceKind.CONFIGS),
-        fetch_def=FetchDefinition(fetch=FetchOption.DEV),
+def config_dev_default(model: type[BaseModel] | None = None) -> ResourceOption:
+    """Resource ``config`` in DEV mode (cached under ~/.sailor/cache)."""
+    return resource(
+        ResourceDefinition(name="config"),
+        FetchDefinition(fetch=FetchOption.DEV),
+        model=model,
     )
 
 
-def secrets_dev_default() -> ResourceOption:
-    """SECRETS in DEV mode: fetch once, cache to ~/.sailor/cache, live-reload."""
-    return ResourceOption(
-        definition=ResourceDefinition(kind=ResourceKind.SECRETS),
-        fetch_def=FetchDefinition(fetch=FetchOption.DEV),
+def secrets_dev_default(model: type[BaseModel] | None = None) -> ResourceOption:
+    """Encrypted resource ``secret`` in DEV mode (cached under ~/.sailor/cache)."""
+    return resource(
+        ResourceDefinition(name="secret", encrypted=True),
+        FetchDefinition(fetch=FetchOption.DEV),
+        model=model,
     )
 
 
-# --- MISC defaults ----------------------------------------------------------
-
-
-def misc_once_default(name: str) -> ResourceOption:
-    """A misc resource fetched exactly once."""
-    return ResourceOption(
-        definition=ResourceDefinition(kind=ResourceKind.MISC, name=name),
-        fetch_def=FetchDefinition(fetch=FetchOption.PULL, once=True),
-    )
-
-
-def misc_pull_default(name: str, interval: float = DEFAULT_PULL_INTERVAL_SECONDS) -> ResourceOption:
-    """A misc resource pulled on an interval."""
-    return ResourceOption(
-        definition=ResourceDefinition(kind=ResourceKind.MISC, name=name),
-        fetch_def=FetchDefinition(fetch=FetchOption.PULL, pull_interval=interval),
+def misc_pull_default(
+    name: str,
+    *,
+    interval: float = DEFAULT_PULL_INTERVAL_SECONDS,
+) -> ResourceOption:
+    """A named raw resource polled on an interval (CONS-RES-4)."""
+    return raw(
+        ResourceDefinition(name=name),
+        FetchDefinition(fetch=FetchOption.PULL, pull_interval=interval),
     )
