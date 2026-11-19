@@ -1,78 +1,168 @@
-"""Exception hierarchy for the Sailor client.
+"""Exception hierarchy and stable error codes for the Sailor client.
 
-Go's ``sailor-go`` distinguishes errors with ``errors.Is``; the Pythonic
-equivalent is catching specific exception types. All exceptions derive from
-:class:`SailorError`.
+Every error raised by the consumer derives from :class:`SailorError` and carries
+a machine-readable :class:`ErrorCode` (``SAILOR_CONSUMER.md`` section 14).
 """
 
 from __future__ import annotations
+
+from enum import Enum
+
+
+class ErrorCode(str, Enum):
+    """Stable error codes defined by the Sailor v1 consumer specification."""
+
+    EMPTY_RESOURCES = "EMPTY_RESOURCES"
+    EMPTY_RESOURCE_NAME = "EMPTY_RESOURCE_NAME"
+    NO_CONNECTION = "NO_CONNECTION"
+    INVALID_URI = "INVALID_URI"
+    INVALID_URI_PREFIX = "INVALID_URI_PREFIX"
+    MISSING_ACCESS_KEY = "MISSING_ACCESS_KEY"
+    MISSING_SECRET_KEY = "MISSING_SECRET_KEY"
+    MISSING_PATH_COMPONENTS = "MISSING_PATH_COMPONENTS"
+    INVALID_SCHEME = "INVALID_SCHEME"
+    MISSING_NAMESPACE_APP = "MISSING_NAMESPACE_APP"
+    DUPLICATE_RESOURCE = "DUPLICATE_RESOURCE"
+    INVALID_PULL_INTERVAL = "INVALID_PULL_INTERVAL"
+    INVALID_FETCH_MODE = "INVALID_FETCH_MODE"
+    UNSUPPORTED_LANG = "UNSUPPORTED_LANG"
+    LOCAL_CONFIG_NOT_FOUND = "LOCAL_CONFIG_NOT_FOUND"
+    LOCAL_CONFIG_INVALID = "LOCAL_CONFIG_INVALID"
+    LOCAL_CONFIG_ENV_NOT_FOUND = "LOCAL_CONFIG_ENV_NOT_FOUND"
+    RESOURCE_NOT_LOADED = "RESOURCE_NOT_LOADED"
+    FALLBACK_FAILED = "FALLBACK_FAILED"
+    TYPE_MISMATCH = "TYPE_MISMATCH"
+    DECODE_FAILED = "DECODE_FAILED"
+    DECRYPT_FAILED = "DECRYPT_FAILED"
+    ALREADY_STARTED = "ALREADY_STARTED"
 
 
 class SailorError(Exception):
     """Base class for every error raised by the Sailor client."""
 
+    code: ErrorCode
 
-# --- Initialization / configuration errors ---------------------------------
+    def __init__(
+        self,
+        code: ErrorCode,
+        message: str = "",
+        *,
+        cause: BaseException | None = None,
+    ) -> None:
+        self.code = code
+        self.cause = cause
+        detail = f"sailor: {code.value}: {message}" if message else f"sailor: {code.value}"
+        super().__init__(detail)
 
 
-class InitError(SailorError):
+class _CodedError(SailorError):
+    """Helper mixin for concrete exception classes bound to a fixed ErrorCode."""
+
+    default_code: ErrorCode
+
+    def __init__(self, message: str = "", *, cause: BaseException | None = None) -> None:
+        super().__init__(self.default_code, message, cause=cause)
+
+
+# --- Construction / configuration errors ------------------------------------
+
+
+class InitError(_CodedError):
     """Raised while constructing a :class:`~sailor.consumer.Consumer`."""
 
-
-class EmptyResourceListError(InitError):
-    """No resources were supplied in ``InitOption.resources``."""
+    default_code = ErrorCode.NO_CONNECTION
 
 
-class NoSailorURIError(InitError):
-    """A connection could not be resolved from URI, options, env, or config."""
+class EmptyResourcesError(InitError):
+    default_code = ErrorCode.EMPTY_RESOURCES
 
 
-class NoSailorURLError(InitError):
-    """The Sailor server address (``addr``/``SAILOR_URL``) is missing."""
+class EmptyResourceNameError(InitError):
+    default_code = ErrorCode.EMPTY_RESOURCE_NAME
 
 
-class NoSailorNamespaceError(InitError):
-    """The namespace (``namespace``/``SAILOR_NS``) is missing."""
+class NoConnectionError(InitError):
+    default_code = ErrorCode.NO_CONNECTION
 
 
-class NoSailorAppError(InitError):
-    """The application name (``app``/``SAILOR_APP``) is missing."""
+class InvalidURIError(InitError):
+    default_code = ErrorCode.INVALID_URI
 
 
-class NoSailorAccessKeyError(InitError):
-    """The access key (``access_key``/``SAILOR_ACCESS_KEY``) is missing."""
+class InvalidURIPrefixError(InitError):
+    default_code = ErrorCode.INVALID_URI_PREFIX
 
 
-class NoSailorSecretKeyError(InitError):
-    """The secret key (``secret_key``/``SAILOR_SECRET_KEY``) is missing."""
+class MissingAccessKeyError(InitError):
+    default_code = ErrorCode.MISSING_ACCESS_KEY
 
 
-# --- Runtime errors ---------------------------------------------------------
+class MissingSecretKeyError(InitError):
+    default_code = ErrorCode.MISSING_SECRET_KEY
 
 
-class ResourceNotLoadedError(SailorError):
-    """A resource was requested before it was successfully loaded."""
+class MissingPathComponentsError(InitError):
+    default_code = ErrorCode.MISSING_PATH_COMPONENTS
 
 
-class ConfigsNotLoadedError(ResourceNotLoadedError):
-    """``get()`` was called but the config resource is not loaded."""
+class InvalidSchemeError(InitError):
+    default_code = ErrorCode.INVALID_SCHEME
 
 
-class SecretsNotLoadedError(ResourceNotLoadedError):
-    """``get_secret()`` was called but the secret resource is not loaded."""
+class MissingNamespaceAppError(InitError):
+    default_code = ErrorCode.MISSING_NAMESPACE_APP
 
 
-class MiscNotLoadedError(ResourceNotLoadedError):
-    """``get_misc(name)`` was called but that misc resource is not loaded."""
+class DuplicateResourceError(InitError):
+    default_code = ErrorCode.DUPLICATE_RESOURCE
 
 
-class FetchError(SailorError):
-    """A resource could not be fetched from its source."""
+class InvalidPullIntervalError(InitError):
+    default_code = ErrorCode.INVALID_PULL_INTERVAL
 
 
-class FetchFallbackFailedError(FetchError):
-    """The primary fetch failed and no usable fallback was available."""
+class InvalidFetchModeError(InitError):
+    default_code = ErrorCode.INVALID_FETCH_MODE
 
 
-class DecryptionError(SailorError):
-    """A secret record could not be decrypted."""
+class LocalConfigNotFoundError(InitError):
+    default_code = ErrorCode.LOCAL_CONFIG_NOT_FOUND
+
+
+class LocalConfigInvalidError(InitError):
+    default_code = ErrorCode.LOCAL_CONFIG_INVALID
+
+
+class LocalConfigEnvNotFoundError(InitError):
+    default_code = ErrorCode.LOCAL_CONFIG_ENV_NOT_FOUND
+
+
+# --- Runtime / decode / fetch errors ----------------------------------------
+
+
+class UnsupportedLangError(_CodedError):
+    default_code = ErrorCode.UNSUPPORTED_LANG
+
+
+class ResourceNotLoadedError(_CodedError):
+    default_code = ErrorCode.RESOURCE_NOT_LOADED
+
+
+class FallbackFailedError(_CodedError):
+    default_code = ErrorCode.FALLBACK_FAILED
+
+
+class TypeMismatchError(_CodedError):
+    default_code = ErrorCode.TYPE_MISMATCH
+
+
+class DecodeFailedError(_CodedError):
+    default_code = ErrorCode.DECODE_FAILED
+
+
+class DecryptFailedError(_CodedError):
+    default_code = ErrorCode.DECRYPT_FAILED
+
+
+class AlreadyStartedError(_CodedError):
+    default_code = ErrorCode.ALREADY_STARTED
